@@ -16,15 +16,27 @@ jobs:
     steps:
       - name: Query the database to keep it active
         run: |
-          code=$(curl -s -o /dev/null -w "%{http_code}" \
+          # Calls public.keep_alive(), a trivial SQL function (returns now())
+          # that the anon role may execute. This runs a real query against
+          # Postgres (which resets the inactivity timer) while exposing no data.
+          # The old version queried the documents table, which the anon role
+          # cannot read, so it returned 401 and never counted as activity.
+          code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
             -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
-            "${{ secrets.SUPABASE_URL }}/rest/v1/documents?select=id&limit=1")
+            -H "Content-Type: application/json" \
+            "${{ secrets.SUPABASE_URL }}/rest/v1/rpc/keep_alive")
           echo "Supabase responded: HTTP $code"
-          # Any response from PostgREST (2xx/4xx) means the database was reached.
-          # Only a server error or no-connection means the ping failed.
-          if [ "$code" = "000" ] || [ "$code" -ge 500 ]; then
-            echo "Keep-alive failed (project may be paused or down)."
+          # ONLY a 2xx means PostgREST actually ran a query against Postgres,
+          # which is what resets Supabase's inactivity timer. A 401/403 is
+          # rejected at the auth layer BEFORE touching the database, so it does
+          # NOT count as activity and must be treated as a failure (this is the
+          # bug that let the project pause on 2026-10-11 despite "successful" runs).
+          if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+            echo "Keep-alive OK (database was queried)."
+          else
+            echo "Keep-alive FAILED: expected 2xx, got $code."
+            echo "A 401/403 means SUPABASE_ANON_KEY is wrong or stale (did the project keys rotate on restore?)."
+            echo "A 5xx/000 means the project is paused or unreachable."
             exit 1
           fi
-          echo "Keep-alive OK."
